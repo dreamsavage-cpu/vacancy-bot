@@ -1,50 +1,59 @@
 """
-Бот для поиска вакансий на HH.ru.
-Использует официальный API (api.hh.ru) через OAuth client_credentials -
-приложение зарегистрировано на dev.hh.ru, ключи в HH_CLIENT_ID/HH_CLIENT_SECRET.
-Фильтрует по тем же критериям, что и vacancy_bot.py (общий filters.py),
-и присылает новые подходящие вакансии в Telegram.
+Read-only HH.ru AI Job Radar.
+
+- searches public vacancies through the official HH API;
+- scores only against local deterministic rules;
+- stores dedup/cutoff in SQLite;
+- sends alerts through Telegram Bot API;
+- never applies, messages employers, or changes an HH profile.
 """
+from __future__ import annotations
+
 import argparse
-import asyncio
-import datetime
+import datetime as dt
 import json
 import logging
+import os
 import re
 import sqlite3
 import time
+from typing import Any
 
 import requests
-from telethon import TelegramClient
-from telethon.errors import FloodWaitError
 
 from config import (
-    API_ID, API_HASH, PHONE,
-    HH_TARGET_CHANNEL, HH_SEARCH_TEXT, HH_AREA, HH_POLL_INTERVAL,
-    HH_CLIENT_ID, HH_CLIENT_SECRET, HH_REQUEST_DELAY,
-    HH_PROFESSIONAL_ROLES, HH_EXPERIENCE, HH_INITIAL_LOOKBACK_HOURS,
+    HH_ACCESS_TOKEN,
+    HH_AREA,
+    HH_CLIENT_ID,
+    HH_CLIENT_SECRET,
+    HH_EMPLOYMENT_FORM,
+    HH_EXPERIENCE,
+    HH_INITIAL_LOOKBACK_HOURS,
+    HH_MIN_SCORE,
+    HH_POLL_INTERVAL,
+    HH_PROFESSIONAL_ROLES,
+    HH_PROJECT_ONLY,
+    HH_REMOTE_ONLY,
+    HH_REQUEST_DELAY,
+    HH_SEARCH_FIELDS,
+    HH_SEARCH_TEXT,
+    HH_WORK_FORMAT,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
 )
-from filters import GOOD_PATTERNS, BLACKLIST_PATTERNS, MIN_SALARY
+from filters import FitResult, score_vacancy
 
 API_BASE = "https://api.hh.ru"
 OAUTH_TOKEN_URL = "https://hh.ru/oauth/token"
-USER_AGENT = "vacancy-bot/1.0 (personal use)"
+USER_AGENT = "ai-job-radar/1.0 (personal read-only vacancy monitor)"
 DB_PATH = "hh_seen.sqlite3"
-TOKEN_CACHE_PATH = "hh_token_cache.json"
+TOKEN_CACHE_PATH = "hh_app_token.json"
 
 PER_PAGE = 100
-MAX_PAGES = 20  # HH сам ограничивает выдачу ~2000 результатами (per_page*page) - это запас
-OVERLAP_MINUTES = 10  # нахлёст cutoff между опросами; дубликаты гасит таблица seen
-
+MAX_PAGES = 20
+OVERLAP_MINUTES = 10
 TAG_RE = re.compile(r"<[^>]+>")
 
-# Для полного описания вакансии (2000+ символов) чёрный список сканируем только
-# по вступлению - иначе случайные совпадения в тексте про плюшки/требования дают
-# почти 100% ложных срабатываний (см. GOOD_KEYWORDS/BLACKLIST в filters.py, которые
-# тюнились под короткие посты в Telegram-каналах, а не под полные официальные тексты).
-BLACKLIST_SCAN_CHARS = 400
-
-# ================= ЛОГИРОВАНИЕ =================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -55,11 +64,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-_TOKEN_CACHE = {"token": None, "expires_at": 0.0}
 
-
-def init_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+def init_db(path: str = DB_PATH) -> sqlite3.Connection:
+    conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE IF NOT EXISTS seen (id TEXT PRIMARY KEY, seen_at TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
     conn.commit()
@@ -80,41 +87,46 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
     conn.commit()
 
 
-def strip_html(html: str) -> str:
-    return re.sub(r"\s+", " ", TAG_RE.sub(" ", html)).strip()
+def strip_html(value: str) -> str:
+    return re.sub(r"\s+", " ", TAG_RE.sub(" ", value or "")).strip()
 
 
-def _load_cached_token() -> tuple[str | None, float]:
+def _load_cached_token() -> str:
     try:
-        with open(TOKEN_CACHE_PATH) as f:
-            data = json.load(f)
-        return data.get("token"), data.get("expires_at", 0.0)
-    except (FileNotFoundError, json.JSONDecodeError, KeyError):
-        return None, 0.0
+        with open(TOKEN_CACHE_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return str(data.get("access_token") or "").strip()
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return ""
 
 
-def _save_cached_token(token: str, expires_at: float) -> None:
-    with open(TOKEN_CACHE_PATH, "w") as f:
-        json.dump({"token": token, "expires_at": expires_at}, f)
+def _save_cached_token(token: str) -> None:
+    with open(TOKEN_CACHE_PATH, "w", encoding="utf-8") as fh:
+        json.dump({"access_token": token}, fh)
 
 
-def get_access_token(force: bool = False) -> str:
-    """OAuth client_credentials. Кэшируется в процессе И на диске (hh_token_cache.json) -
-    hh_bot.py обычно запускается заново каждый цикл под systemd timer, а не живёт одним
-    процессом, поэтому без дискового кэша каждый запуск запрашивал бы новый токен. HH же
-    отклоняет повторный client_credentials-запрос 403 "app token refresh too early", пока
-    предыдущий токен ещё не истёк (проверено живым запросом) - без кэша бот падал бы
-    почти на каждом цикле. HH не всегда возвращает expires_in - если поля нет, считаем
-    токен живым 1 час (консервативный дефолт), а не бессрочным."""
-    now = time.time()
-    if not force and _TOKEN_CACHE["token"] and now < _TOKEN_CACHE["expires_at"]:
-        return _TOKEN_CACHE["token"]
+def get_access_token(force_generate: bool = False) -> str:
+    """
+    HH application token strategy:
+    1) explicit HH_ACCESS_TOKEN from .env;
+    2) locally cached application token;
+    3) generate one via client_credentials only when no token exists.
 
-    if not force:
-        token, expires_at = _load_cached_token()
-        if token and now < expires_at:
-            _TOKEN_CACHE["token"], _TOKEN_CACHE["expires_at"] = token, expires_at
-            return token
+    We intentionally do not refresh on a timer. HH application tokens are treated
+    as durable credentials; if HH returns 401, delete/update the token explicitly.
+    """
+    if HH_ACCESS_TOKEN and not force_generate:
+        return HH_ACCESS_TOKEN
+
+    cached = _load_cached_token()
+    if cached and not force_generate:
+        return cached
+
+    if not HH_CLIENT_ID or not HH_CLIENT_SECRET:
+        raise RuntimeError(
+            "Нет HH_ACCESS_TOKEN и нет HH_CLIENT_ID/HH_CLIENT_SECRET. "
+            "Дождись одобрения приложения и заполни .env."
+        )
 
     resp = requests.post(
         OAUTH_TOKEN_URL,
@@ -126,221 +138,267 @@ def get_access_token(force: bool = False) -> str:
         headers={"User-Agent": USER_AGENT},
         timeout=20,
     )
-    if resp.status_code == 403:
-        # HH иногда отказывает в переоформлении, пока предыдущий токен ещё не истёк
-        # ("app token refresh too early") - в этом случае используем то, что уже есть
-        # (в памяти или на диске), вместо падения. Пробрасываем ошибку, только если
-        # использовать реально нечего.
-        fallback = _TOKEN_CACHE["token"] or _load_cached_token()[0]
-        if fallback:
-            logger.warning("HH отклонил обновление токена (%s), использую предыдущий", resp.text[:200])
-            _TOKEN_CACHE["token"] = fallback
-            _TOKEN_CACHE["expires_at"] = now + 300  # короткий запас, скоро попробуем обновить снова
-            return fallback
     resp.raise_for_status()
-    data = resp.json()
-    expires_in = data.get("expires_in", 3600)
-    token = data["access_token"]
-    expires_at = now + expires_in - 60
-    _TOKEN_CACHE["token"], _TOKEN_CACHE["expires_at"] = token, expires_at
-    _save_cached_token(token, expires_at)
-    logger.info("HH OAuth токен обновлён (истекает через %s сек)", expires_in)
+    token = str(resp.json()["access_token"])
+    _save_cached_token(token)
+    logger.info("Сгенерирован и локально сохранён HH app token")
     return token
 
 
-def hh_api_get(path: str, params: dict) -> dict | None:
-    """GET к api.hh.ru с Bearer-токеном. На 401 - один форс-рефреш токена и повтор.
-    На 429/5xx - лог и None, чтобы вызывающий код мягко пропустил цикл/страницу."""
-    for attempt in (1, 2):
-        headers = {
-            "Authorization": f"Bearer {get_access_token(force=(attempt == 2))}",
-            "User-Agent": USER_AGENT,
-        }
-        resp = requests.get(f"{API_BASE}{path}", params=params, headers=headers, timeout=20)
-        if resp.status_code == 401 and attempt == 1:
-            logger.warning("HH API вернул 401, обновляю токен и повторяю запрос")
-            continue
-        if resp.status_code == 429:
-            logger.warning("HH API вернул 429 (rate limit), пропускаю до следующего опроса")
-            return None
-        resp.raise_for_status()
-        return resp.json()
-    return None
+def hh_api_get(path: str, params: dict[str, Any]) -> dict[str, Any] | None:
+    token = get_access_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": USER_AGENT,
+    }
+    resp = requests.get(f"{API_BASE}{path}", params=params, headers=headers, timeout=25)
+
+    if resp.status_code == 401:
+        raise RuntimeError(
+            "HH вернул 401. Обнови HH_ACCESS_TOKEN в .env либо удали hh_app_token.json "
+            "и сгенерируй новый app token."
+        )
+    if resp.status_code == 429:
+        logger.warning("HH API: 429 rate limit; цикл будет повторён позже")
+        return None
+    if 500 <= resp.status_code < 600:
+        logger.warning("HH API: %s; цикл будет повторён позже", resp.status_code)
+        return None
+
+    resp.raise_for_status()
+    return resp.json()
 
 
-def fetch_vacancies_since(date_from_iso: str) -> list[dict]:
-    """Постранично забирает вакансии через официальный поиск HH.ru, отфильтрованные
-    по тексту/региону/дате публикации на стороне HH - в отличие от RSS-экспорта,
-    который всегда отдавал только топ-20 без пагинации."""
-    params = {
+def _add_multi(params: dict[str, Any], key: str, values: list[str]) -> None:
+    if values:
+        params[key] = values
+
+
+def build_search_params(date_from_iso: str, page: int = 0) -> dict[str, Any]:
+    params: dict[str, Any] = {
         "text": HH_SEARCH_TEXT,
         "area": HH_AREA,
         "order_by": "publication_time",
-        "search_field": "name",
         "date_from": date_from_iso,
         "per_page": PER_PAGE,
+        "page": page,
     }
-    if HH_PROFESSIONAL_ROLES:
-        params["professional_role"] = HH_PROFESSIONAL_ROLES.split(",")
-    if HH_EXPERIENCE:
-        params["experience"] = HH_EXPERIENCE.split(",")
 
-    items = []
+    if HH_SEARCH_FIELDS:
+        params["search_field"] = HH_SEARCH_FIELDS
+
+    _add_multi(params, "professional_role", HH_PROFESSIONAL_ROLES)
+    _add_multi(params, "experience", HH_EXPERIENCE)
+
+    work_formats = list(HH_WORK_FORMAT)
+    employment_forms = list(HH_EMPLOYMENT_FORM)
+    if HH_REMOTE_ONLY and "REMOTE" not in work_formats:
+        work_formats.append("REMOTE")
+    if HH_PROJECT_ONLY and "PROJECT" not in employment_forms:
+        employment_forms.append("PROJECT")
+
+    _add_multi(params, "work_format", work_formats)
+    _add_multi(params, "employment_form", employment_forms)
+    return params
+
+
+def fetch_vacancies_since(date_from_iso: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
     for page in range(MAX_PAGES):
-        data = hh_api_get("/vacancies", {**params, "page": page})
+        data = hh_api_get("/vacancies", build_search_params(date_from_iso, page=page))
         if data is None:
             break
         items.extend(data.get("items", []))
-        if page + 1 >= data.get("pages", 0):
+        if page + 1 >= int(data.get("pages", 0)):
             break
     return items
 
 
-def fetch_full_description(vacancy_id: str) -> str | None:
-    """Полное описание вакансии - список отдаёт только короткие snippet-выдержки,
-    для скоринга по GOOD_KEYWORDS/BLACKLIST нужен полный текст."""
+def fetch_full_vacancy(vacancy_id: str) -> dict[str, Any] | None:
     data = hh_api_get(f"/vacancies/{vacancy_id}", {})
     if data is None:
         return None
-    return strip_html(data.get("description", ""))
+    data["description"] = strip_html(data.get("description") or "")
+    return data
 
 
-def extract_salary_rub(salary: dict | None) -> int | None:
-    """Максимум из salary.from/to в рублях. Не-рублёвые зарплаты считаем
-    неуказанными - как и раньше при regex-парсинге RSS-текста, который тоже
-    распознавал только ₽. Без net/gross-пересчёта - берём число как есть."""
-    if not salary or salary.get("currency") not in ("RUR", "RUB"):
-        return None
-    values = [v for v in (salary.get("from"), salary.get("to")) if v]
-    return max(values) if values else None
+def _format_salary(vacancy: dict[str, Any], fit: FitResult) -> str:
+    salary = vacancy.get("salary_range") or vacancy.get("salary") or {}
+    if fit.salary_rub is None:
+        return "не указана"
+    currency = salary.get("currency") or "RUR"
+    suffix = "₽" if currency in {"RUR", "RUB"} else currency
+    low = salary.get("from")
+    high = salary.get("to")
+    if low and high:
+        return f"{int(low):,}–{int(high):,} {suffix}".replace(",", " ")
+    if low:
+        return f"от {int(low):,} {suffix}".replace(",", " ")
+    if high:
+        return f"до {int(high):,} {suffix}".replace(",", " ")
+    return f"{fit.salary_rub:,} {suffix}".replace(",", " ")
 
 
-def hh_vacancy_suitable(title: str, employer: str, description: str) -> bool:
-    """Аналог filters.is_vacancy_suitable(), адаптированный под длинные официальные
-    описания HH.ru: чёрный список сканируется только по вступлению, а не по всему
-    тексту, и не применяется is_resume() (в выдаче поиска HH резюме не встречаются).
-    Город здесь не проверяется - он уже отфильтрован на стороне HH через area=HH_AREA
-    в fetch_vacancies_since()."""
-    intro = " ".join([title, employer, description[:BLACKLIST_SCAN_CHARS]])
-    if any(p.search(intro) for p in BLACKLIST_PATTERNS):
-        return False
+def format_message(vacancy: dict[str, Any], fit: FitResult) -> str:
+    if fit.score >= 80:
+        marker = "🔥"
+        verdict = "очень сильный матч"
+    elif fit.score >= 65:
+        marker = "✅"
+        verdict = "стоит смотреть"
+    else:
+        marker = "👀"
+        verdict = "возможный матч"
 
-    full_text = " ".join([title, employer, description])
-    text_lower = full_text.lower()
-    score = sum(1 for p in GOOD_PATTERNS if p.search(full_text))
+    title = vacancy.get("name") or "Без названия"
+    employer = (vacancy.get("employer") or {}).get("name") or "—"
+    area = (vacancy.get("area") or {}).get("name") or "—"
+    url = vacancy.get("alternate_url") or vacancy.get("url") or ""
+    salary = _format_salary(vacancy, fit)
 
-    if any(term in text_lower for term in ['c-level', 'директор', 'account director', 'head of', 'chief']):
-        return score >= 1
-    if 'product manager' in text_lower or 'продакт' in text_lower:
-        return score >= 3
-    return score >= 2
+    mode = []
+    if fit.remote:
+        mode.append("удалённо")
+    if fit.project:
+        mode.append("проект/подработка")
+    mode_str = " · ".join(mode) if mode else "формат не приоритетный"
+
+    age = ""
+    if fit.age_hours is not None:
+        if fit.age_hours < 1:
+            age = f"{max(1, int(fit.age_hours * 60))} мин назад"
+        else:
+            age = f"{fit.age_hours:.1f} ч назад"
+
+    reasons = "\n".join(f"• {x}" for x in fit.reasons) or "• совпадение по ключевым навыкам"
+    risks = "\n".join(f"• {x}" for x in fit.risks) or "• явных рисков по описанию не найдено"
+
+    return (
+        f"{marker} {fit.score}/100 — {verdict}\n\n"
+        f"{title}\n"
+        f"🏢 {employer} · {area}\n"
+        f"💰 {salary}\n"
+        f"🧭 {mode_str}"
+        + (f" · {age}" if age else "")
+        + f"\n\nПочему подходит:\n{reasons}\n\nРиски:\n{risks}\n\n{url}"
+    )
 
 
-def format_message(item: dict, salary: int | None) -> str:
-    title = item.get("name", "")
-    employer = (item.get("employer") or {}).get("name") or "—"
-    region = (item.get("area") or {}).get("name") or "—"
-    salary_str = f"от {salary:,} ₽".replace(",", " ") if salary else "не указана"
-    url = item.get("alternate_url") or item.get("url", "")
-    return f"💼 {title}\n🏢 {employer} · {region}\n💰 {salary_str}\n{url}"
+def send_telegram(text: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError("Заполни TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID для отправки уведомлений")
+    resp = requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "disable_web_page_preview": True,
+        },
+        timeout=20,
+    )
+    resp.raise_for_status()
 
 
-async def send_new_vacancies(client: TelegramClient, conn: sqlite3.Connection, items: list, dry_run: bool) -> int:
-    cur = conn.cursor()
-    sent = 0
+def process_items(
+    conn: sqlite3.Connection,
+    items: list[dict[str, Any]],
+    dry_run: bool,
+) -> int:
+    matched = 0
     for item in items:
-        vid = str(item["id"])
-        cur.execute("SELECT 1 FROM seen WHERE id = ?", (vid,))
-        if cur.fetchone():
+        vid = str(item.get("id") or "")
+        if not vid:
+            continue
+        if conn.execute("SELECT 1 FROM seen WHERE id = ?", (vid,)).fetchone():
             continue
 
-        salary = extract_salary_rub(item.get("salary"))
-        salary_ok = salary is None or salary >= MIN_SALARY
+        try:
+            full = fetch_full_vacancy(vid)
+        except Exception as exc:
+            logger.warning("Не удалось загрузить вакансию %s: %s", vid, exc)
+            continue
+        time.sleep(HH_REQUEST_DELAY)
+        if not full:
+            continue
 
-        suitable = False
-        if salary_ok:
-            description = None
-            try:
-                description = fetch_full_description(vid)
-            except Exception as e:
-                logger.warning("Не удалось загрузить описание вакансии %s: %s", vid, e)
-            time.sleep(HH_REQUEST_DELAY)
-            suitable = hh_vacancy_suitable(
-                item.get("name", ""),
-                (item.get("employer") or {}).get("name", ""),
-                description or "",
-            )
+        fit = score_vacancy(full, min_score=HH_MIN_SCORE)
 
+        # Mark processed vacancies only in real mode. Dry-run remains repeatable.
         if not dry_run:
-            cur.execute("INSERT OR IGNORE INTO seen (id, seen_at) VALUES (?, datetime('now'))", (vid,))
+            conn.execute(
+                "INSERT OR IGNORE INTO seen (id, seen_at) VALUES (?, datetime('now'))",
+                (vid,),
+            )
             conn.commit()
 
-        if not suitable:
+        if not fit.is_fit:
             continue
 
-        message = format_message(item, salary)
-
+        matched += 1
+        message = format_message(full, fit)
         if dry_run:
-            logger.info("[DRY-RUN] Подходит: %s", item.get("name", ""))
-            sent += 1
-            continue
+            print("\n" + message + "\n" + ("-" * 72))
+        else:
+            send_telegram(message)
+            logger.info("Отправлена вакансия %s (%s/100)", full.get("name"), fit.score)
 
-        for attempt in range(3):
-            try:
-                await client.send_message(HH_TARGET_CHANNEL, message, link_preview=False)
-                sent += 1
-                logger.info("Отправлена вакансия: %s", item.get("name", ""))
-                break
-            except FloodWaitError as e:
-                logger.warning("FloodWait: жду %s сек", e.seconds)
-                await asyncio.sleep(e.seconds)
-            except Exception as e:
-                logger.error("Ошибка отправки: %s", e)
-                break
-    return sent
+    return matched
 
 
-async def run_once(client: TelegramClient, conn: sqlite3.Connection, dry_run: bool = False) -> None:
-    now = datetime.datetime.now(datetime.timezone.utc)
+def run_once(conn: sqlite3.Connection, dry_run: bool = False) -> int:
+    now = dt.datetime.now(dt.timezone.utc)
     cutoff = get_meta(conn, "last_cutoff")
     if not cutoff:
-        cutoff = (now - datetime.timedelta(hours=HH_INITIAL_LOOKBACK_HOURS)).isoformat()
+        cutoff = (now - dt.timedelta(hours=HH_INITIAL_LOOKBACK_HOURS)).isoformat()
 
-    try:
-        items = fetch_vacancies_since(cutoff)
-    except Exception as e:
-        logger.error("Ошибка запроса к HH API: %s", e)
-        return
-
-    logger.info("Получено %d вакансий с HH.ru API", len(items))
-    sent = await send_new_vacancies(client, conn, items, dry_run)
-    logger.info("Разослано новых подходящих вакансий: %d", sent)
+    items = fetch_vacancies_since(cutoff)
+    logger.info("HH: получено %d вакансий", len(items))
+    matched = process_items(conn, items, dry_run=dry_run)
+    logger.info("Подходящих вакансий: %d", matched)
 
     if not dry_run:
-        next_cutoff = now - datetime.timedelta(minutes=OVERLAP_MINUTES)
-        set_meta(conn, "last_cutoff", next_cutoff.isoformat())
+        set_meta(
+            conn,
+            "last_cutoff",
+            (now - dt.timedelta(minutes=OVERLAP_MINUTES)).isoformat(),
+        )
+    return matched
 
 
-async def main(once: bool, dry_run: bool) -> None:
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Read-only AI Job Radar for HH.ru")
+    parser.add_argument("--once", action="store_true", help="один цикл и выход")
+    parser.add_argument("--dry-run", action="store_true", help="не писать БД и не отправлять Telegram")
+    parser.add_argument(
+        "--fixtures",
+        metavar="PATH",
+        help="локальный JSON-массив вакансий: проверить scoring вообще без HH API",
+    )
+    args = parser.parse_args()
+
+    if args.fixtures:
+        with open(args.fixtures, encoding="utf-8") as fh:
+            fixtures = json.load(fh)
+        for vacancy in fixtures:
+            fit = score_vacancy(vacancy, min_score=HH_MIN_SCORE)
+            print(format_message(vacancy, fit))
+            print("-" * 72)
+        return
+
     conn = init_db()
-    get_access_token()  # падаем сразу и явно, если ключи неверны, а не в глубине первого цикла
-    client = TelegramClient("hh_session", API_ID, API_HASH)
-    await client.start(phone=PHONE)
-    logger.info("HH-бот запущен (area=%s, интервал=%d сек)", HH_AREA, HH_POLL_INTERVAL)
+    get_access_token()
 
-    if once:
-        await run_once(client, conn, dry_run)
-        await client.disconnect()
+    if args.once:
+        run_once(conn, dry_run=args.dry_run)
         return
 
     while True:
-        await run_once(client, conn, dry_run)
-        await asyncio.sleep(HH_POLL_INTERVAL)
+        try:
+            run_once(conn, dry_run=args.dry_run)
+        except Exception:
+            logger.exception("Ошибка цикла HH")
+        time.sleep(HH_POLL_INTERVAL)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="HH.ru vacancy bot")
-    parser.add_argument("--once", action="store_true", help="Один проход вместо бесконечного цикла")
-    parser.add_argument("--dry-run", action="store_true", help="Не отправлять сообщения и не писать в БД, только логировать совпадения")
-    args = parser.parse_args()
-    asyncio.run(main(once=args.once, dry_run=args.dry_run))
+    main()
