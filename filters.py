@@ -1,10 +1,8 @@
-"""
-Deterministic scoring for the personal AI job radar.
+"""Transparent, deterministic scoring for the personal AI job radar.
 
-No paid LLM is required. The scorer is intentionally transparent: it rewards
-the user's actual directions (AI video, AI/LLM automation, bots/parsers/API,
-and simple 3D), remote/project work and freshness, while flagging heavy
-engineering requirements and unclear AI-generation costs.
+Fit Score answers "how suitable is this work?". Money Risk answers "how likely
+is the job to require the user's own money or an expensive delivery setup?".
+The two values are intentionally independent and require no paid LLM API.
 """
 from __future__ import annotations
 
@@ -16,30 +14,33 @@ from typing import Any
 
 CATEGORY_TERMS: dict[str, list[tuple[str, int]]] = {
     "AI Video": [
-        ("ai video", 20), ("ai creator", 18), ("ai-generated video", 18),
-        ("генеративное видео", 18), ("нейросет", 8), ("higgsfield", 16),
-        ("runway", 12), ("veo", 12), ("kling", 10), ("seedance", 10),
-        ("pika", 7), ("capcut", 6), ("ugc", 6), ("short-form", 6),
-        ("reels", 4), ("shorts", 4), ("lip-sync", 6), ("lipsync", 6),
+        ("ai video", 24), ("ai creator", 20), ("ai-generated video", 22),
+        ("генеративное видео", 22), ("нейросет", 8), ("higgsfield", 18),
+        ("runway", 14), ("veo", 14), ("kling", 12), ("seedance", 12),
+        ("pika", 8), ("capcut", 7), ("ugc", 7), ("short-form", 7),
+        ("reels", 5), ("shorts", 5), ("lip-sync", 7), ("lipsync", 7),
     ],
-    "AI / LLM automation": [
-        ("ai automation", 20), ("автоматизац", 9), ("llm", 16),
-        ("gpt", 12), ("openai", 10), ("claude", 9), ("rag", 11),
-        ("ai agent", 18), ("ai-агент", 18), ("ии-агент", 18),
-        ("нейроагент", 18), ("n8n", 11), ("make.com", 8), ("zapier", 8),
-        ("mcp", 10), ("prompt engineering", 8),
+    "Simple AI automation": [
+        ("ai automation", 24), ("простая автоматизац", 20),
+        ("no-code", 12), ("low-code", 12), ("llm", 14), ("gpt", 12),
+        ("openai", 10), ("claude", 9), ("ai agent", 18),
+        ("ai-агент", 18), ("ии-агент", 18), ("нейроагент", 18),
+        ("n8n", 16), ("make.com", 13), ("zapier", 13), ("mcp", 9),
+        ("prompt engineering", 8),
     ],
-    "Bots / parsers / API": [
-        ("telegram bot", 20), ("telegram-бот", 20), ("телеграм-бот", 20),
-        ("чат-бот", 16), ("chatbot", 14), ("парсер", 16), ("parser", 14),
-        ("scraping", 14), ("web scraping", 14), ("playwright", 8),
-        ("selenium", 8), ("api integration", 12), ("api интеграц", 12),
-        ("python automation", 12), ("мониторинг", 6), ("webhook", 7),
+    "Telegram bots / parsers / API": [
+        ("telegram bot", 24), ("telegram-бот", 24), ("телеграм-бот", 24),
+        ("чат-бот", 18), ("chatbot", 16), ("парсер", 20), ("parser", 17),
+        ("scraping", 16), ("web scraping", 16), ("playwright", 9),
+        ("selenium", 9), ("api integration", 18), ("api интеграц", 18),
+        ("интеграция api", 18), ("python automation", 15),
+        ("мониторинг", 7), ("webhook", 9),
     ],
-    "3D": [
-        ("blender", 18), ("freecad", 18), ("cad", 10), ("3d model", 14),
-        ("3d modeling", 14), ("3д модел", 14), ("3d визуал", 10),
-        ("3д визуал", 10), ("3d render", 8),
+    "Simple 3D": [
+        ("blender", 22), ("freecad", 22), ("простое 3d", 22),
+        ("простое 3д", 22), ("3d model", 16), ("3d modeling", 16),
+        ("3д модел", 16), ("3d визуал", 12), ("3д визуал", 12),
+        ("3d render", 10), ("cad", 8),
     ],
 }
 
@@ -48,46 +49,73 @@ IRRELEVANT_TITLE_TERMS = [
     "повар", "медсест", "врач", "юрист", "охранник", "электрик", "сварщик",
 ]
 
-HEAVY_ENGINEERING_TERMS = [
-    "kubernetes", "django", "fastapi", "postgresql", "redis", "microservice",
-    "микросервис", "ci/cd", "system design", "алгоритм", "leetcode",
-    "highload", "high load", "golang", "java spring",
+SENIOR_ENGINEERING_TITLE_TERMS = [
+    "senior backend", "senior developer", "senior software", "senior python",
+    "lead backend", "backend lead", "tech lead", "тимлид", "team lead",
+    "backend developer", "backend engineer", "devops engineer", "ml engineer",
+    "machine learning engineer", "data scientist", "platform engineer",
+    "site reliability engineer", "sre engineer", "архитектор систем",
 ]
-HEAVY_TITLE_TERMS = [
-    "senior backend", "senior developer", "senior python developer",
-    "backend developer", "backend engineer", "ml engineer", "data scientist",
-    "devops engineer",
+HEAVY_ENGINEERING_TERMS = [
+    "kubernetes", "k8s", "django", "fastapi", "postgresql", "redis",
+    "microservice", "микросервис", "ci/cd", "system design", "системный дизайн",
+    "production engineering", "production-grade", "production system",
+    "промышленная разработка", "highload", "high load", "distributed system",
+    "распределенные системы", "распределённые системы", "golang", "java spring",
+    "pytorch", "tensorflow", "mlops", "airflow", "algorithms", "алгоритм",
+]
+CODING_HEAVY_TERMS = [
+    "coding-heavy", "strong coding", "advanced python", "глубокое знание python",
+    "коммерческая разработка", "code review", "unit testing", "integration testing",
+    "software architecture", "архитектура по", "computer science",
 ]
 
 CREDIT_PROVIDED_TERMS = [
     "предоставим доступ", "предоставляем доступ", "доступы предостав",
-    "оплачиваем подписк", "подписки оплачивает", "credits provided",
-    "we provide access", "subscriptions covered", "company account",
-    "full access to higgsfield", "access to higgsfield",
+    "оплачиваем подписк", "подписки оплачивает", "кредиты предостав",
+    "credits provided", "we provide access", "subscriptions covered",
+    "company account", "company-provided account", "tools are provided",
+    "full access to higgsfield", "access to higgsfield", "cover subscriptions",
 ]
 CREDIT_OWN_TERMS = [
     "свои подписк", "собственные подписк", "свои аккаунт", "собственные аккаунт",
-    "за свой счет", "за свой счёт", "own subscription", "own account",
-    "your own subscription", "your own account",
+    "за свой счет", "за свой счёт", "личная подписка", "own subscription",
+    "own account", "your own subscription", "your own account", "at your expense",
 ]
 PAID_AI_TOOL_TERMS = [
     "higgsfield", "runway", "veo", "kling", "seedance", "midjourney",
-    "elevenlabs", "flux", "pika", "suno",
+    "elevenlabs", "flux", "pika", "suno", "heygen", "sora",
+]
+HIGH_VOLUME_TERMS = [
+    "high volume", "high-volume", "large volume", "быстрый темп", "высокий темп",
+    "большой объем", "большой объём", "массовое производство", "конвейер",
+    "ежедневный выпуск", "каждый день", "daily output", "tight deadlines",
+]
+FULL_TIME_TERMS = [
+    "full-time", "full time", "полный рабочий день", "полная занятость",
+    "40 hours", "40+ hours", "40 часов", "forty hours",
 ]
 
 
 @dataclass
 class FitResult:
-    score: int
+    fit_score: int
+    money_risk: int
     is_fit: bool
     categories: list[str]
     reasons: list[str]
     risks: list[str]
+    positive_flags: list[str]
     credit_status: str
     remote: bool
     project: bool
     age_hours: float | None
     salary_rub: int | None
+
+    @property
+    def score(self) -> int:
+        """Backward-compatible alias for integrations using the old field."""
+        return self.fit_score
 
 
 def _contains(text: str, term: str) -> bool:
@@ -142,57 +170,65 @@ def _vacancy_text(vacancy: dict) -> str:
         ((vacancy.get("snippet") or {}).get("requirement") or ""),
         ((vacancy.get("snippet") or {}).get("responsibility") or ""),
     ]
-    skills = vacancy.get("key_skills") or []
-    for skill in skills:
-        if isinstance(skill, dict):
-            parts.append(skill.get("name") or "")
-        elif isinstance(skill, str):
-            parts.append(skill)
+    for skill in vacancy.get("key_skills") or []:
+        parts.append((skill.get("name") or "") if isinstance(skill, dict) else str(skill))
     return " ".join(parts)
+
+
+def _has_high_output_requirement(text: str) -> bool:
+    if any(_contains(text, term) for term in HIGH_VOLUME_TERMS):
+        return True
+    quantity_patterns = [
+        (r"\b(?:от\s*)?([1-9]\d*)\s*(?:видео|ролик\w*|креатив\w*)\s*(?:в|за)\s*(?:день|сутки)", 5),
+        (r"\b(?:от\s*)?([1-9]\d*)\s*(?:видео|ролик\w*|креатив\w*)\s*(?:в|за)\s*недел", 20),
+        (r"\b([1-9]\d*)\+?\s*(?:videos?|clips?|creatives?)\s*(?:per|a)\s*day", 5),
+        (r"\b([1-9]\d*)\+?\s*(?:videos?|clips?|creatives?)\s*(?:per|a)\s*week", 20),
+    ]
+    for pattern, threshold in quantity_patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match and int(match.group(1)) >= threshold:
+            return True
+    return False
 
 
 def score_vacancy(vacancy: dict, min_score: int = 45, now: dt.datetime | None = None) -> FitResult:
     text = _vacancy_text(vacancy)
+    lower = text.lower()
     title = (vacancy.get("name") or "").lower()
 
     category_scores: dict[str, int] = {}
     category_hits: dict[str, list[str]] = {}
     for category, terms in CATEGORY_TERMS.items():
-        hits: list[str] = []
-        score = 0
-        for term, weight in terms:
-            if _contains(text, term):
-                hits.append(term)
-                score += weight
+        hits = [term for term, _weight in terms if _contains(text, term)]
         if hits:
-            # Avoid one description with a giant keyword dump dominating the score.
-            category_scores[category] = min(score, 46)
+            raw_score = sum(weight for term, weight in terms if term in hits)
+            category_scores[category] = min(raw_score, 48)
             category_hits[category] = hits
 
-    skill_score = min(sum(category_scores.values()), 58)
-    score = skill_score
+    skill_score = min(sum(category_scores.values()), 62)
+    fit_score = skill_score
+    money_risk = 0
     reasons: list[str] = []
     risks: list[str] = []
+    positive_flags: list[str] = []
 
     ranked_categories = sorted(category_scores, key=category_scores.get, reverse=True)
     for category in ranked_categories[:2]:
-        sample = ", ".join(category_hits[category][:4])
-        reasons.append(f"{category}: {sample}")
+        reasons.append(f"{category}: {', '.join(category_hits[category][:4])}")
 
-    title_category_hit = any(
+    if any(
         _contains(title, term)
         for terms in CATEGORY_TERMS.values()
         for term, _weight in terms
-    )
-    if title_category_hit:
-        score += 8
+    ):
+        fit_score += 10
         reasons.append("ключевая специализация прямо в названии")
 
     work_formats = _ids(vacancy.get("work_format"))
     schedules = _ids(vacancy.get("schedule"))
     remote = "REMOTE" in work_formats or "remote" in schedules
     if remote:
-        score += 12
+        fit_score += 12
         reasons.append("удалённо")
 
     employment_forms = _ids(vacancy.get("employment_form"))
@@ -202,67 +238,97 @@ def score_vacancy(vacancy: dict, min_score: int = 45, now: dt.datetime | None = 
         or legacy_employment & {"project", "part"}
     )
     if project:
-        score += 10
+        fit_score += 10
         reasons.append("проект / подработка")
 
     age_hours = _published_age_hours(vacancy.get("published_at"), now=now)
     if age_hours is not None:
         if age_hours <= 2:
-            score += 12
+            fit_score += 10
             reasons.append("опубликована менее 2 часов назад")
         elif age_hours <= 6:
-            score += 8
+            fit_score += 7
             reasons.append("опубликована менее 6 часов назад")
         elif age_hours <= 24:
-            score += 4
+            fit_score += 3
             reasons.append("опубликована сегодня")
 
     salary_rub = extract_salary_rub(vacancy)
     if salary_rub is not None:
         if salary_rub >= 150_000:
-            score += 12
+            fit_score += 10
         elif salary_rub >= 100_000:
-            score += 8
+            fit_score += 7
         elif salary_rub >= 70_000:
-            score += 4
+            fit_score += 4
         reasons.append(f"доход до/от {salary_rub:,} ₽".replace(",", " "))
 
-    lower = text.lower()
     has_paid_tools = any(_contains(lower, term) for term in PAID_AI_TOOL_TERMS)
-    if any(_contains(lower, term) for term in CREDIT_PROVIDED_TERMS):
-        credit_status = "provided"
-        score += 4
-        reasons.append("работодатель явно предоставляет AI-доступы/подписки")
-    elif any(_contains(lower, term) for term in CREDIT_OWN_TERMS):
+    has_provided_credits = any(_contains(lower, term) for term in CREDIT_PROVIDED_TERMS)
+    has_own_credits = any(_contains(lower, term) for term in CREDIT_OWN_TERMS)
+    if has_own_credits:
         credit_status = "own"
-        score -= 14
-        risks.append("требуются свои платные AI-подписки/аккаунты")
+        money_risk += 45
+        fit_score -= 12
+        risks.append("нужны свои платные AI-подписки/аккаунты")
+    elif has_provided_credits:
+        credit_status = "provided"
+        fit_score += 5
+        positive_flags.append("клиент явно предоставляет AI-доступы/кредиты")
     elif has_paid_tools:
         credit_status = "unspecified"
-        score -= 4
+        money_risk += 18
+        fit_score -= 4
         risks.append("не указано, кто оплачивает AI-сервисы/кредиты")
     else:
         credit_status = "not_applicable"
 
     heavy_hits = [term for term in HEAVY_ENGINEERING_TERMS if _contains(lower, term)]
-    heavy_title = any(term in title for term in HEAVY_TITLE_TERMS)
-    if heavy_title or len(heavy_hits) >= 3:
-        score -= 20
-        risks.append("сильный уклон в полноценную backend/engineering-разработку")
+    coding_hits = [term for term in CODING_HEAVY_TERMS if _contains(lower, term)]
+    senior_engineering = any(term in title for term in SENIOR_ENGINEERING_TITLE_TERMS)
+    if senior_engineering:
+        fit_score -= 48
+        money_risk += 38
+        risks.append("Senior Backend/DevOps/ML/production engineering — слишком тяжёлый стек")
+    elif len(heavy_hits) >= 3:
+        fit_score -= 38
+        money_risk += 32
+        risks.append("обязателен тяжёлый production/backend/ML-стек")
+    elif heavy_hits or coding_hits:
+        fit_score -= 22
+        money_risk += 22
+        risks.append("coding-heavy стек выходит за рамки простой автоматизации")
+
+    if _has_high_output_requirement(lower):
+        fit_score -= 8
+        money_risk += 28
+        risks.append("высокая скорость/объём производства")
+
+    full_time_ids = {x.lower() for x in employment_forms | legacy_employment | schedules}
+    full_time = bool(full_time_ids & {"full", "full_time", "fulltime", "fullday"}) or any(
+        _contains(lower, term) for term in FULL_TIME_TERMS
+    )
+    if full_time and not project:
+        fit_score -= 10
+        money_risk += 24
+        risks.append("обязательная full-time/40h+ загрузка")
 
     if any(term in title for term in IRRELEVANT_TITLE_TERMS) and skill_score < 25:
-        score = min(score, 10)
+        fit_score = min(fit_score, 10)
         risks.append("нерелевантная основная профессия")
 
-    score = max(0, min(100, int(score)))
-    is_fit = bool(ranked_categories) and score >= min_score
+    fit_score = max(0, min(100, int(fit_score)))
+    money_risk = max(0, min(100, int(money_risk)))
+    is_fit = bool(ranked_categories) and fit_score >= min_score
 
     return FitResult(
-        score=score,
+        fit_score=fit_score,
+        money_risk=money_risk,
         is_fit=is_fit,
         categories=ranked_categories,
         reasons=reasons[:6],
-        risks=risks[:4],
+        risks=risks[:6],
+        positive_flags=positive_flags,
         credit_status=credit_status,
         remote=remote,
         project=project,

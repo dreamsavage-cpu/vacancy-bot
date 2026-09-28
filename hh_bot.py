@@ -240,10 +240,10 @@ def _format_salary(vacancy: dict[str, Any], fit: FitResult) -> str:
 
 
 def format_message(vacancy: dict[str, Any], fit: FitResult) -> str:
-    if fit.score >= 80:
+    if fit.fit_score >= 80:
         marker = "🔥"
         verdict = "очень сильный матч"
-    elif fit.score >= 65:
+    elif fit.fit_score >= 65:
         marker = "✅"
         verdict = "стоит смотреть"
     else:
@@ -272,15 +272,22 @@ def format_message(vacancy: dict[str, Any], fit: FitResult) -> str:
 
     reasons = "\n".join(f"• {x}" for x in fit.reasons) or "• совпадение по ключевым навыкам"
     risks = "\n".join(f"• {x}" for x in fit.risks) or "• явных рисков по описанию не найдено"
+    positive_flags = ""
+    if fit.positive_flags:
+        positive_flags = "\n\nПозитивные флаги:\n" + "\n".join(
+            f"• {x}" for x in fit.positive_flags
+        )
 
     return (
-        f"{marker} {fit.score}/100 — {verdict}\n\n"
+        f"{marker} Fit {fit.fit_score} / Money Risk {fit.money_risk} — {verdict}\n\n"
         f"{title}\n"
         f"🏢 {employer} · {area}\n"
         f"💰 {salary}\n"
         f"🧭 {mode_str}"
         + (f" · {age}" if age else "")
-        + f"\n\nПочему подходит:\n{reasons}\n\nРиски:\n{risks}\n\n{url}"
+        + f"\n\nПочему подходит:\n{reasons}"
+        + positive_flags
+        + f"\n\nРиски:\n{risks}\n\n{url}"
     )
 
 
@@ -340,7 +347,12 @@ def process_items(
             print("\n" + message + "\n" + ("-" * 72))
         else:
             send_telegram(message)
-            logger.info("Отправлена вакансия %s (%s/100)", full.get("name"), fit.score)
+            logger.info(
+                "Отправлена вакансия %s (Fit %s / Money Risk %s)",
+                full.get("name"),
+                fit.fit_score,
+                fit.money_risk,
+            )
 
     return matched
 
