@@ -1,0 +1,24 @@
+[
+  {
+    "id": "demo-1",
+    "name": "AI Video Creator / Higgsfield",
+    "description": "Short-form ads with Higgsfield, Runway, Veo and CapCut. We provide access to Higgsfield and cover subscriptions.",
+    "work_format": [{"id": "REMOTE"}],
+    "employment_form": {"id": "PROJECT"},
+    "published_at": "2026-09-28T14:20:00+00:00",
+    "salary_range": {"from": 120000, "to": 180000, "currency": "RUR"},
+    "employer": {"name": "Demo Studio"},
+    "area": {"name": "Россия"},
+    "alternate_url": "https://example.invalid/demo-1"
+  },
+  {
+    "id": "demo-2",
+    "name": "Telegram bot / AI automation developer",
+    "description": "Build a Telegram bot, OpenAI RAG assistant and API integrations. Python automation. Remote.",
+    "work_format": [{"id": "REMOTE"}],
+    "published_at": "2026-09-28T12:00:00+00:00",
+    "employer": {"name": "Demo Automation"},
+    "area": {"name": "Россия"},
+    "alternate_url": "https://example.invalid/demo-2"
+  }
+]

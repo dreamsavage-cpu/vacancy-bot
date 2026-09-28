@@ -1,11 +1,12 @@
 # secrets
 .env
 
-# Telegram session files (equivalent to auth tokens - never commit)
+# Telegram session files
 *.session
 *.session-journal
 
-# HH.ru OAuth access token cache - equivalent to an auth token, never commit
+# HH app token cache
+hh_app_token.json
 hh_token_cache.json
 
 # runtime state / data
@@ -15,7 +16,8 @@ hh_token_cache.json
 # python
 __pycache__/
 *.pyc
+.venv/
 venv/
 
-# local Claude Code instructions - не относится к самому проекту, не в репозитории
+# local instructions
 CLAUDE.md

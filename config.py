@@ -3,74 +3,64 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-API_ID = int(os.environ['API_ID'])
-API_HASH = os.environ['API_HASH']
-PHONE = os.environ['PHONE']
-TARGET_CHANNEL = os.environ['TARGET_CHANNEL']
 
-# ================= HH.RU BOT =================
-# Отдельный канал/чат для вакансий с HH.ru (по умолчанию - тот же, что и для каналов)
-HH_TARGET_CHANNEL = os.environ.get('HH_TARGET_CHANNEL', TARGET_CHANNEL)
+def _csv(name: str, default: str = "") -> list[str]:
+    raw = os.environ.get(name, default)
+    return [part.strip() for part in raw.split(",") if part.strip()]
 
-# Поисковый запрос HH.ru (синтаксис: https://hh.ru/article/1175 - поддерживает OR, кавычки)
+
+def _bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# ================= HH.RU =================
 HH_SEARCH_TEXT = os.environ.get(
-    'HH_SEARCH_TEXT',
-    '"project manager" OR "программный директор" OR "руководитель проекта" OR '
-    '"руководитель проектов" OR "program manager" OR "delivery manager" OR '
-    '"technical project manager" OR "engineering manager" OR "руководитель направления" OR '
-    '"account director" OR PMO OR "проектный офис"'
+    "HH_SEARCH_TEXT",
+    '"AI video" OR "AI creator" OR Higgsfield OR Runway OR Veo OR Kling OR Seedance OR '
+    '"генеративное видео" OR нейросет OR LLM OR GPT OR OpenAI OR Claude OR RAG OR '
+    '"AI agent" OR "AI automation" OR автоматизация OR "Telegram bot" OR "чат-бот" OR '
+    'парсер OR parser OR scraping OR Blender OR FreeCAD OR "3D"'
 )
 
-# Регион поиска: 113 = Россия, 1 = Москва, 2 = Санкт-Петербург (см. https://api.hh.ru/areas)
-HH_AREA = os.environ.get('HH_AREA', '113')
+# 113 = Russia. Can be overridden with any HH area id.
+HH_AREA = os.environ.get("HH_AREA", "113")
+HH_SEARCH_FIELDS = _csv("HH_SEARCH_FIELDS", "name,description")
+HH_POLL_INTERVAL = int(os.environ.get("HH_POLL_INTERVAL", "1800"))
+HH_REQUEST_DELAY = float(os.environ.get("HH_REQUEST_DELAY", "0.25"))
+HH_INITIAL_LOOKBACK_HOURS = int(os.environ.get("HH_INITIAL_LOOKBACK_HOURS", "24"))
+HH_MIN_SCORE = int(os.environ.get("HH_MIN_SCORE", "45"))
 
-# Как часто опрашивать HH.ru, секунд
-HH_POLL_INTERVAL = int(os.environ.get('HH_POLL_INTERVAL', 1800))
+HH_PROFESSIONAL_ROLES = _csv("HH_PROFESSIONAL_ROLES")
+HH_EXPERIENCE = _csv("HH_EXPERIENCE")
 
-# OAuth-приложение HH.ru (dev.hh.ru), client_credentials flow. Обязательны.
-HH_CLIENT_ID = os.environ['HH_CLIENT_ID']
-HH_CLIENT_SECRET = os.environ['HH_CLIENT_SECRET']
+# Optional hard API filters. By default we do NOT force them: remote/project
+# vacancies get a score bonus so permanent remote work is not accidentally lost.
+HH_REMOTE_ONLY = _bool("HH_REMOTE_ONLY", False)
+HH_PROJECT_ONLY = _bool("HH_PROJECT_ONLY", False)
+HH_WORK_FORMAT = _csv("HH_WORK_FORMAT")
+HH_EMPLOYMENT_FORM = _csv("HH_EMPLOYMENT_FORM")
 
-# Пауза между запросами полного описания вакансии, секунд
-HH_REQUEST_DELAY = float(os.environ.get('HH_REQUEST_DELAY', 0.3))
+# HH application auth. Preferred after approval: copy the current app token from
+# dev.hh.ru/admin to HH_ACCESS_TOKEN. If it is omitted, CLIENT_ID/SECRET can be
+# used once to generate and cache an application token locally.
+HH_ACCESS_TOKEN = os.environ.get("HH_ACCESS_TOKEN", "").strip()
+HH_CLIENT_ID = os.environ.get("HH_CLIENT_ID", "").strip()
+HH_CLIENT_SECRET = os.environ.get("HH_CLIENT_SECRET", "").strip()
 
-# Опционально: id профролей через запятую для сужения поиска на стороне HH
-# (см. https://api.hh.ru/professional_roles). 107 = "Руководитель проектов".
-# Пусто по умолчанию - таксономия HH слишком грубая, чтобы полагаться на неё одну;
-# основной арбитр качества - keyword-скоринг в filters.py.
-HH_PROFESSIONAL_ROLES = os.environ.get('HH_PROFESSIONAL_ROLES', '')
+# ================= TELEGRAM OUTPUT =================
+# HH notifications use Bot API, not a personal Telegram session.
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# Опционально: id уровней опыта через запятую (noExperience, between1And3,
-# between3And6, moreThan6). Пусто = без фильтра по опыту на стороне HH.
-HH_EXPERIENCE = os.environ.get('HH_EXPERIENCE', '')
-
-# Глубина поиска в часах при самом первом запуске (пока нет сохранённого cutoff)
-HH_INITIAL_LOOKBACK_HOURS = int(os.environ.get('HH_INITIAL_LOOKBACK_HOURS', 24))
-
-SOURCE_CHANNELS = [
-    'Relocats',
-    'forproducts',
-    'jobfortm',
-    'forchiefs',
-    'careerstation_pm',
-    'habr_career',
-    'zarubezhom_jobs',
-    'vacanciesbest',
-    'yojob',
-    'young_relocate',
-    'careerspace',
-    'hcareers_jobs',
-    'projects_jobs_feed',
-    'workfortop',
-    'agile_jobs',
-    'workfortop_pro',
-    't_crew',
-    'mtsbankcareer',
-    'wantapply_managers',
-    'remote_jobs_relocate',
-    'it_vakansii_jobs',
-    'g_jobbot',
-    'geekjobs',
-    'remotegeekjob',
-    'careerYlej',
-]
+# ================= OPTIONAL TELEGRAM SOURCE LISTENER =================
+# Kept from the upstream project as an optional feature. It still uses Telethon
+# to READ channels, but is not used by hh_bot.py.
+_api_id_raw = os.environ.get("API_ID", "").strip()
+API_ID = int(_api_id_raw) if _api_id_raw else None
+API_HASH = os.environ.get("API_HASH", "").strip()
+PHONE = os.environ.get("PHONE", "").strip()
+TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "").strip()
+SOURCE_CHANNELS = _csv("SOURCE_CHANNELS")
